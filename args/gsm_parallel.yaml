@@ -1,0 +1,42 @@
+# args/gsm_parallel.yaml
+
+project: coconut
+save_path: YOUR_SAVE_DIR
+name: gsm-parallel
+
+only_eval: False    # True to just run the K refinements
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 2
+epochs_per_stage: 3
+max_latent_stage: 3
+pad_latent_to_max: True
+
+save_only_improve: False
+uniform_prob: 0.0
+model_id: openai-community/gpt2
+load_model_path: None     # load vanilla coconut weights from [checkpoints/gsm-coconut-final.pt]
+seed: 0
+resume: 0
+bf16: False
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+reset_optimizer: True
+batch_size_training: 32
+debug: False
+gradient_accumulation_steps: 1
+num_epochs: 25
+lr: !!float "1e-4"
+weight_decay: 0.01
+
+# new
+parallel:
+  enabled: true        # route to ParallelCoconut
+  num_slots: 6         # N latent slots (total latent positions to refine)
+  num_refine: 2        # K refinement passes (full-sequence sweeps); TBD how high we can go w/o memory issues
+  slot_init: random  # random|fixed|learned
+  tc_loss_weight: 0.0  # 0.0 = off; >0 enables TC loss (needs teacher b_i; setup cache)
