@@ -1,7 +1,7 @@
 # need 4 gpus
 
 project: coconut
-save_path: YOUR_PATH_TO_SAVE_THE_MODEL
+save_path: /home/vc383/scratch_coconut/gsm-cot/checkpoints
 name: gsm-cot
 
 only_eval: False
@@ -22,7 +22,7 @@ model_id: openai-community/gpt2
 load_model_path: None
 seed: 0
 resume: 0
-bf16: False
+bf16: True    # given we're training on A100 or better
 train_path: data/gsm_train.json
 val_path: data/gsm_valid.json
 reset_optimizer: False

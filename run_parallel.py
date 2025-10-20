@@ -1,6 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
 import torch
 import torch.distributed
 import torch.optim as optim
@@ -18,7 +15,7 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 # --- CHANGED: import ParallelCoconut instead of Coconut ---
 from parallel_coconut import ParallelCoconut  # NEW
-# (We keep Coconut import entirely out of this entrypoint to avoid confusion.)
+# (We keep Coconut import entirely out)
 
 from dataset import (
     get_dataset,

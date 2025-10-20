@@ -1,7 +1,7 @@
 # args/gsm_parallel.yaml
 
 project: coconut
-save_path: YOUR_SAVE_DIR
+save_path: checkpoints/parallel_runs
 name: gsm-parallel
 
 only_eval: False    # True to just run the K refinements
