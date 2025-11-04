@@ -1,8 +1,8 @@
 # need 4 gpus
 
 project: coconut
-save_path: /share/sds/vc383/scratch_coconut/gsm-coconut/checkpoints
-name: gsm-coconut
+save_path: /share/sds/vc383/scratch_coconut/smol135-gsm-coconut/checkpoints
+name: smol135-gsm-coconut
 
 only_eval: False
 
@@ -18,8 +18,8 @@ pad_latent_to_max: True
 
 save_only_improve: False
 uniform_prob: 0.0
-model_id: openai-community/gpt2
-load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/checkpoint_24
+model_id: HuggingFaceTB/SmolLM-135M
+load_model_path: /share/sds/vc383/scratch_coconut/smol135-gsm-cot/checkpoints/smol135-gsm-cot/checkpoint_4
 seed: 0
 resume: 3
 bf16: False

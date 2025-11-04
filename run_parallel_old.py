@@ -1,5 +1,3 @@
-# improved from run_stabilized.py to include parallelism
-
 import torch
 import torch.distributed
 import torch.optim as optim
@@ -15,7 +13,10 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from coconut_stabilized_parallel import CoconutParallel
+# --- CHANGED: import ParallelCoconut instead of Coconut ---
+from parallel_coconut import ParallelCoconut  # NEW
+# (We keep Coconut import entirely out)
+
 from dataset import (
     get_dataset,
     get_question_latent_dataset,
@@ -32,60 +33,12 @@ import json
 import gc
 import argparse
 import functools
-import math
 from utils import Config, set_seed
-
-
-def _resolve_freeze_schedule(raw_schedule):
-    if raw_schedule is None:
-        return []
-    if isinstance(raw_schedule, int):
-        return [int(raw_schedule)]
-    if isinstance(raw_schedule, (list, tuple)):
-        return [int(x) for x in raw_schedule]
-    raise ValueError("freeze_schedule must be int or list of ints.")
-
-
-def _apply_gpt2_freeze(module, freeze_blocks):
-    """
-    Freeze embeddings, first `freeze_blocks` transformer blocks, and lm head on GPT-2 modules.
-    """
-    if freeze_blocks is None:
-        return
-
-    base = module.base_causallm if hasattr(module, "base_causallm") else module
-    transformer = getattr(base, "transformer", None)
-    if transformer is None or not hasattr(transformer, "h"):
-        return
-
-    # Unfreeze everything first
-    for param in base.parameters():
-        param.requires_grad = True
-
-    if freeze_blocks <= 0:
-        return
-
-    modules_to_freeze = []
-    if hasattr(transformer, "wte"):
-        modules_to_freeze.append(transformer.wte)
-    if hasattr(transformer, "wpe"):
-        modules_to_freeze.append(transformer.wpe)
-
-    if hasattr(transformer, "h"):
-        blocks = list(transformer.h)
-        modules_to_freeze.extend(blocks[: min(freeze_blocks, len(blocks))])
-
-    if hasattr(base, "lm_head"):
-        modules_to_freeze.append(base.lm_head)
-
-    for mod in modules_to_freeze:
-        for param in mod.parameters():
-            param.requires_grad = False
 
 
 def main():
 
-    parser = argparse.ArgumentParser(description="coconut")
+    parser = argparse.ArgumentParser(description="parallel-coconut")  # CHANGED
     parser.add_argument("config_file")
     args = parser.parse_args()
 
@@ -104,24 +57,6 @@ def main():
         print("Config:", config_dict)
 
     configs = Config(config_dict)
-    configs.latent_detach = getattr(configs, "latent_detach", True)
-    configs.latent_adapter = getattr(configs, "latent_adapter", "ln")
-    configs.parallel_mode = getattr(configs, "parallel_mode", "triangular")
-    configs.num_parallel_passes = getattr(configs, "num_parallel_passes", None)
-    configs.ema_decay = getattr(configs, "ema_decay", 0.0)
-    configs.latent_init = getattr(configs, "latent_init", "token")
-    configs.latent_init_std = getattr(configs, "latent_init_std", 0.02)
-    configs.tc_weight = getattr(configs, "tc_weight", 0.05)
-    configs.sd_weight = getattr(configs, "sd_weight", 0.0)
-    configs.tc_distance = getattr(configs, "tc_distance", "mse")
-    configs.tc_norm = getattr(configs, "tc_norm", "rms")
-    configs.parallel_inference = getattr(configs, "parallel_inference", True)
-    configs.use_tail_only_forward = getattr(configs, "use_tail_only_forward", True)
-    configs.use_prefix_kv_cache = getattr(configs, "use_prefix_kv_cache", True)
-    configs.freeze_schedule = _resolve_freeze_schedule(
-        getattr(configs, "freeze_schedule", [6, 0, 0, 0])
-    )
-    configs.grad_clip_norm = getattr(configs, "grad_clip_norm", 0.5)
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -134,10 +69,6 @@ def main():
     # check if the job is preempted and resumed.
 
     if len(cur_ckpts) > 0 and not configs.only_eval:
-        # if there are previous checkpoints, and only_eval is False
-        # it means the previous run was preempted and the program is restarted.
-        # need to find the latest checkpoint and resume from that.
-
         if rank == 0:
             print(
                 f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
@@ -145,26 +76,43 @@ def main():
 
         checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
         checkpoints.sort(key=lambda x: int(x.split("_")[1]))
-
-        # Get the last item in the sorted list
         latest_checkpoint = checkpoints[-1] if checkpoints else None
         configs.resume = int(latest_checkpoint.split("_")[1])
         load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
-
         configs.load_model_path = load_dir
         print(f"Loading from previous run epoch_{configs.resume}!")
 
     elif configs.resume != 0:
-        # by setting `resume`, we can skip a few epoches at the beginning.
         if configs.load_model_path == "None":
             print(
                 f"Warning: you want to skip the first {configs.resume} but you are not loading any existing checkpoint!"
             )
-            # not an intended use case at this point
         print(
             f"Loading from {configs.load_model_path} and skip the first {configs.resume} epochs"
         )
 
+    # --- NEW: parse/normalize parallel block with defaults ---
+    par = getattr(configs, "parallel", {})
+    if isinstance(par, dict):
+        par = Config(par)
+    # sensible defaults; you can override in YAML
+    if not hasattr(par, "enabled"):
+        par.enabled = True
+    if not hasattr(par, "num_refine"):
+        par.num_refine = 2             # refinement passes (K)
+    if not hasattr(par, "slot_init"):
+        par.slot_init = "random"     # random|fixed|learned
+    if not hasattr(par, "learned_slot_count"):
+        par.learned_slot_count = 64
+    if not hasattr(par, "projector_dim"):
+        par.projector_dim = 0
+    if not hasattr(par, "tc_loss_weight"):
+        par.tc_loss_weight = 0.0       # 0.0 = off (placeholder only)
+    configs.parallel = par
+    if rank == 0:
+        print(f"[ParallelCoconut] using config: {vars(par)}")
+
+    # base model + tokenizer (same as vanilla)
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
@@ -178,46 +126,42 @@ def main():
     loaded = False
 
     if configs.load_model_path != "None":
+        def _state_dict_contains_component(state_dict, component):
+            return any(component in key.split(".") for key in state_dict.keys())
+
         saved_weights = torch.load(
             configs.load_model_path, map_location=torch.device(rank)
         )
 
-        if configs.coconut and not any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # we are loading a base model into coconut model
-            # e.g., for GSM8k, we used a SFTed model to skip the stage 0
+        # NOTE: ParallelCoconut wraps a base_causallm just like Coconut.
+        # State dict checks mirror your vanilla logic but support prefixes like module.base_causallm.
+        has_wrapper_block = _state_dict_contains_component(saved_weights, "base_causallm")
+
+        if configs.coconut and not has_wrapper_block:
+            # loading a base model (e.g., SFT) into a wrapper
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
-        elif not configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            raise ValueError("Cannot load coconut model weights into a causallm model")
+        elif not configs.coconut and has_wrapper_block:
+            raise ValueError("Cannot load coconut/parallel model weights into a bare causallm model")
 
-        elif configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # loading from preempted run
-            # will handle later
+        elif configs.coconut and has_wrapper_block:
+            # loading from preempted run (full wrapper state)
             pass
 
         else:
-            # resume or evaluate sft model
+            # resume/eval for base SFT model
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
+    # initialize new tokens (same as vanilla)
     if not (configs.cot or configs.no_thoughts or configs.no_cot):
-        # if we need new tokens, initialize their embeddings and lm heads
         model.resize_token_embeddings(len(tokenizer))
         embeddings = model.get_input_embeddings()
         target_id = tokenizer.convert_tokens_to_ids("<<")
-        # initialize the new token embeddings with a known token
-        # it helps stablize the training
         for token_id in [latent_id, start_id, end_id]:
-            target_embedding = embeddings.weight.data[target_id] 
+            target_embedding = embeddings.weight.data[target_id]
             embeddings.weight.data[token_id] = target_embedding
-            # The input embeddings and lm heads are tied in GPT2. So the code below is not necessary
             lm_head = model.lm_head
             lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
@@ -225,28 +169,25 @@ def main():
         configs.c_thought = 0
         configs.coconut = False
 
-    if configs.coconut:
-        model = CoconutParallel(
+    # --- CHANGED: Always wrap with ParallelCoconut when parallel.enabled ---
+    if configs.parallel.enabled:
+        model = ParallelCoconut(
             model,
-            latent_id,
-            start_id,
-            end_id,
-            tokenizer.eos_token_id,
-            latent_detach=configs.latent_detach,
-            latent_adapter=configs.latent_adapter,
-            parallel_mode=configs.parallel_mode,
-            num_parallel_passes=configs.num_parallel_passes,
-            ema_decay=configs.ema_decay,
-            latent_init=configs.latent_init,
-            latent_init_std=configs.latent_init_std,
-            tc_weight=configs.tc_weight,
-            sd_weight=configs.sd_weight,
-            tc_distance=configs.tc_distance,
-            tc_norm=configs.tc_norm,
-            use_tail_only_forward=configs.use_tail_only_forward,
-            use_prefix_kv_cache=configs.use_prefix_kv_cache,
+            latent_token_id=latent_id,
+            start_latent_id=start_id,
+            end_latent_id=end_id,
+            eos_token_id=tokenizer.eos_token_id,
+            num_refine=configs.parallel.num_refine,
+            slot_init=configs.parallel.slot_init,
+            learned_slot_count=configs.parallel.learned_slot_count,
+            projector_dim=configs.parallel.projector_dim,
         )
-        model.parallel_inference = configs.parallel_inference
+    else:
+        # Fallback: behave like vanilla Coconut only if requested by YAML
+        # (kept for safety; ideally this entrypoint is used only for Parallel)
+        from coconut import Coconut
+        if configs.coconut:
+            model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -268,12 +209,9 @@ def main():
     # if only eval, use ddp (to avoid bugs in fsdp)
     if configs.only_eval:
         parallel_model = DDP(model, device_ids=[rank])
-
     else:
         parallel_model = FSDP(
-            model,
-            auto_wrap_policy=llama_auto_wrap_policy,
-            device_id=rank,
+            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
         )
 
     del model
@@ -281,7 +219,7 @@ def main():
     if rank == 0:
         print(parallel_model)
 
-    # prepare the ground truth answer and cot for evaluation
+    # prepare eval strings
     question_val = [d["question"] for d in json.load(open(configs.val_path))]
     answers_val = [
         d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
@@ -307,6 +245,8 @@ def main():
     if not configs.debug and not configs.only_eval and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
+        # also log parallel config separately for clarity
+        wandb_run.config.update({"parallel_cfg": vars(configs.parallel)}, allow_val_change=True)
         text_table = wandb.Table(columns=["step", "text"])
 
     else:
@@ -314,7 +254,6 @@ def main():
 
     if configs.reset_optimizer:
         optimizer = None
-
     else:
         optimizer = optim.AdamW(
             parallel_model.parameters(),
@@ -325,13 +264,15 @@ def main():
     best_acc = 0
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
-    current_freeze_stage = None
 
     for epoch in range(configs.resume, configs.num_epochs):
 
+        # NOTE: You can keep the same stage scheduling to match Coconut curriculum,
+        # or set epochs_per_stage large to effectively do "one-stage" parallel.
         scheduled_stage = (
             0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
         )
+
         dataset_gen_val = get_question_latent_dataset(
             scheduled_stage,
             base_dataset_valid,
@@ -374,9 +315,6 @@ def main():
                 sampler=DistributedSampler(dataset_train, shuffle=True),
             )
 
-            # the sampler is deterministic even if shuffle is set to True
-            # so we have shuffled the dataset when it's constructed (at every epoch).
-
             dataset_loss_val = get_cot_latent_dataset(
                 scheduled_stage,
                 base_dataset_valid,
@@ -399,7 +337,6 @@ def main():
 
             if configs.reset_optimizer:
                 del optimizer
-
                 optimizer = optim.AdamW(
                     parallel_model.parameters(),
                     lr=configs.lr,
@@ -407,18 +344,6 @@ def main():
                 )
 
             parallel_model.module.train()
-
-            freeze_stage = min(
-                scheduled_stage, len(configs.freeze_schedule) - 1
-            )
-            if configs.freeze_schedule and freeze_stage != current_freeze_stage:
-                target_blocks = configs.freeze_schedule[freeze_stage]
-                if rank == 0:
-                    print(
-                        f"Applying freeze schedule stage {freeze_stage}: freezing {target_blocks} GPT-2 blocks."
-                    )
-                _apply_gpt2_freeze(parallel_model.module, target_blocks)
-                current_freeze_stage = freeze_stage
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -448,9 +373,6 @@ def main():
                             )
                         text_str += "====" * 10 + "\n"
                     text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
-
                     wandb_run.log({"data_table": copy(text_table)})
 
                 total_train_steps += 1
@@ -463,18 +385,6 @@ def main():
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
 
-                latent_stats = getattr(outputs, "stats", None)
-                grad_norm = None
-                if configs.grad_clip_norm and configs.grad_clip_norm > 0:
-                    if isinstance(parallel_model, FSDP):
-                        grad_norm = parallel_model.clip_grad_norm_(
-                            configs.grad_clip_norm
-                        )
-                    else:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            parallel_model.parameters(), configs.grad_clip_norm
-                        )
-
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
@@ -483,32 +393,12 @@ def main():
                     pbar.update(1)
 
                 if wandb_run and rank == 0:
-                    param_sq_norm = 0.0
-                    for param in parallel_model.parameters():
-                        param_sq_norm += (
-                            param.detach().float().norm(p=2).item() ** 2
-                        )
-                    param_norm = math.sqrt(param_sq_norm)
-                    supervised_tokens = int(
-                        batch["labels"].ne(-100).sum().detach().cpu().item()
-                    )
                     log_dict = {
                         "train/epoch": epoch + 1,
                         "train/step": epoch * len(train_dataloader) + step,
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
-                        "train/grad_norm": float(grad_norm)
-                        if grad_norm is not None
-                        else None,
-                        "train/param_norm": param_norm,
-                        "train/supervised_tokens": supervised_tokens,
                     }
-                    if latent_stats:
-                        for key, value in latent_stats.items():
-                            if value is not None:
-                                log_dict[f"train/{key}"] = float(value)
-
-                    log_dict = {k: v for k, v in log_dict.items() if v is not None}
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
@@ -581,7 +471,6 @@ def main():
                     for k, v in batch.items()
                     if v != None and k not in ["idx", "position_ids"]
                 }
-                # https://github.com/huggingface/transformers/issues/32492
 
                 assert len(batch["input_ids"]) == 1
                 answer = answers_val[test_idx.cpu().item()]
@@ -590,26 +479,11 @@ def main():
 
                 total += 1
 
-                # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
-                if configs.parallel_inference:
-                    outputs = parallel_model.module.generate(
-                        **batch,
-                        max_new_tokens=max_new_tokens,
-                        synced_gpus=not configs.only_eval,
-                        parallel_mode=configs.parallel_mode,
-                        num_parallel_passes=configs.num_parallel_passes,
-                        ema_decay=configs.ema_decay,
-                    )
-                else:
-                    base_kwargs = {
-                        "input_ids": batch["input_ids"],
-                        "attention_mask": batch.get(
-                            "attention_mask",
-                            torch.ones_like(batch["input_ids"], device=batch["input_ids"].device),
-                        ),
-                        "max_new_tokens": max_new_tokens,
-                    }
-                    outputs = parallel_model.module.base_causallm.generate(**base_kwargs)
+                outputs = parallel_model.module.generate(
+                    **batch,
+                    max_new_tokens=max_new_tokens,
+                    synced_gpus=not configs.only_eval,
+                )
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
@@ -618,7 +492,6 @@ def main():
                 )
 
                 if idx < 5 and rank == 0:
-                    # print some examples
                     print(
                         f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'"
                     )

@@ -1,8 +1,9 @@
 # need 4 gpus
+# max_new_tokens still hardcoded at 64 inside run_smol.py
 
 project: coconut
-save_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints
-name: gsm-cot
+save_path: /share/sds/vc383/scratch_coconut/smol135-gsm-cot/checkpoints
+name: smol135-gsm-cot
 
 only_eval: False
 
@@ -18,11 +19,11 @@ pad_latent_to_max: True
 
 save_only_improve: True
 uniform_prob: 0.0
-model_id: openai-community/gpt2
+model_id: HuggingFaceTB/SmolLM-135M
 load_model_path: None
 seed: 0
 resume: 0
-bf16: False    # as in Coconut
+bf16: False
 train_path: data/gsm_train.json
 val_path: data/gsm_valid.json
 reset_optimizer: False

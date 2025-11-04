@@ -1,4 +1,6 @@
-# improved from run_stabilized.py to include parallelism
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# improved from run.py to include stab tricks
 
 import torch
 import torch.distributed
@@ -15,7 +17,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from coconut_stabilized_parallel import CoconutParallel
+from coconut_stabilized import Coconut
 from dataset import (
     get_dataset,
     get_question_latent_dataset,
@@ -106,18 +108,6 @@ def main():
     configs = Config(config_dict)
     configs.latent_detach = getattr(configs, "latent_detach", True)
     configs.latent_adapter = getattr(configs, "latent_adapter", "ln")
-    configs.parallel_mode = getattr(configs, "parallel_mode", "triangular")
-    configs.num_parallel_passes = getattr(configs, "num_parallel_passes", None)
-    configs.ema_decay = getattr(configs, "ema_decay", 0.0)
-    configs.latent_init = getattr(configs, "latent_init", "token")
-    configs.latent_init_std = getattr(configs, "latent_init_std", 0.02)
-    configs.tc_weight = getattr(configs, "tc_weight", 0.05)
-    configs.sd_weight = getattr(configs, "sd_weight", 0.0)
-    configs.tc_distance = getattr(configs, "tc_distance", "mse")
-    configs.tc_norm = getattr(configs, "tc_norm", "rms")
-    configs.parallel_inference = getattr(configs, "parallel_inference", True)
-    configs.use_tail_only_forward = getattr(configs, "use_tail_only_forward", True)
-    configs.use_prefix_kv_cache = getattr(configs, "use_prefix_kv_cache", True)
     configs.freeze_schedule = _resolve_freeze_schedule(
         getattr(configs, "freeze_schedule", [6, 0, 0, 0])
     )
@@ -226,7 +216,7 @@ def main():
         configs.coconut = False
 
     if configs.coconut:
-        model = CoconutParallel(
+        model = Coconut(
             model,
             latent_id,
             start_id,
@@ -234,19 +224,7 @@ def main():
             tokenizer.eos_token_id,
             latent_detach=configs.latent_detach,
             latent_adapter=configs.latent_adapter,
-            parallel_mode=configs.parallel_mode,
-            num_parallel_passes=configs.num_parallel_passes,
-            ema_decay=configs.ema_decay,
-            latent_init=configs.latent_init,
-            latent_init_std=configs.latent_init_std,
-            tc_weight=configs.tc_weight,
-            sd_weight=configs.sd_weight,
-            tc_distance=configs.tc_distance,
-            tc_norm=configs.tc_norm,
-            use_tail_only_forward=configs.use_tail_only_forward,
-            use_prefix_kv_cache=configs.use_prefix_kv_cache,
         )
-        model.parallel_inference = configs.parallel_inference
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -591,25 +569,11 @@ def main():
                 total += 1
 
                 # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
-                if configs.parallel_inference:
-                    outputs = parallel_model.module.generate(
-                        **batch,
-                        max_new_tokens=max_new_tokens,
-                        synced_gpus=not configs.only_eval,
-                        parallel_mode=configs.parallel_mode,
-                        num_parallel_passes=configs.num_parallel_passes,
-                        ema_decay=configs.ema_decay,
-                    )
-                else:
-                    base_kwargs = {
-                        "input_ids": batch["input_ids"],
-                        "attention_mask": batch.get(
-                            "attention_mask",
-                            torch.ones_like(batch["input_ids"], device=batch["input_ids"].device),
-                        ),
-                        "max_new_tokens": max_new_tokens,
-                    }
-                    outputs = parallel_model.module.base_causallm.generate(**base_kwargs)
+                outputs = parallel_model.module.generate(
+                    **batch,
+                    max_new_tokens=max_new_tokens,
+                    synced_gpus=not configs.only_eval,
+                )
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()

@@ -1,0 +1,43 @@
+# need 4 gpus
+# improved from gsm_coconut to include stabilization tricks
+
+project: coconut-stabilized
+save_path: /share/sds/vc383/scratch_coconut/gsm-coconut-2/checkpoints
+name: gsm-coconut-stabilized
+
+only_eval: False
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 2
+epochs_per_stage: 4 ##
+max_latent_stage: 3
+pad_latent_to_max: True
+latent_detach: True
+latent_adapter: ln ##
+freeze_schedule:
+  - 3
+  - 2
+  - 1
+  - 0
+
+save_only_improve: False
+uniform_prob: 0.0
+model_id: openai-community/gpt2
+load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/gsm-cot/checkpoint_6
+seed: 0
+resume: 3
+bf16: False
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+reset_optimizer: True
+batch_size_training: 32
+debug: False
+gradient_accumulation_steps: 1
+num_epochs: 25
+lr: !!float "3e-4" ## 
+weight_decay: 0.01
+grad_clip_norm: 1

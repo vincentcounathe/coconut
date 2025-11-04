@@ -1,8 +1,12 @@
-# improved from run_stabilized.py to include parallelism
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# TO BE FIXED
 
 import torch
 import torch.distributed
 import torch.optim as optim
+import re
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import wandb
@@ -15,7 +19,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from coconut_stabilized_parallel import CoconutParallel
+from coconut import Coconut
 from dataset import (
     get_dataset,
     get_question_latent_dataset,
@@ -32,55 +36,20 @@ import json
 import gc
 import argparse
 import functools
-import math
 from utils import Config, set_seed
 
 
-def _resolve_freeze_schedule(raw_schedule):
-    if raw_schedule is None:
-        return []
-    if isinstance(raw_schedule, int):
-        return [int(raw_schedule)]
-    if isinstance(raw_schedule, (list, tuple)):
-        return [int(x) for x in raw_schedule]
-    raise ValueError("freeze_schedule must be int or list of ints.")
-
-
-def _apply_gpt2_freeze(module, freeze_blocks):
-    """
-    Freeze embeddings, first `freeze_blocks` transformer blocks, and lm head on GPT-2 modules.
-    """
-    if freeze_blocks is None:
-        return
-
-    base = module.base_causallm if hasattr(module, "base_causallm") else module
-    transformer = getattr(base, "transformer", None)
-    if transformer is None or not hasattr(transformer, "h"):
-        return
-
-    # Unfreeze everything first
-    for param in base.parameters():
-        param.requires_grad = True
-
-    if freeze_blocks <= 0:
-        return
-
-    modules_to_freeze = []
-    if hasattr(transformer, "wte"):
-        modules_to_freeze.append(transformer.wte)
-    if hasattr(transformer, "wpe"):
-        modules_to_freeze.append(transformer.wpe)
-
-    if hasattr(transformer, "h"):
-        blocks = list(transformer.h)
-        modules_to_freeze.extend(blocks[: min(freeze_blocks, len(blocks))])
-
-    if hasattr(base, "lm_head"):
-        modules_to_freeze.append(base.lm_head)
-
-    for mod in modules_to_freeze:
-        for param in mod.parameters():
-            param.requires_grad = False
+# --- VC amend ---
+def _build_wd_param_lists(model):
+    decay, nodecay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 1 or name.endswith(".bias"):
+            nodecay.append(param)
+        else:
+            decay.append(param)
+    return decay, nodecay
 
 
 def main():
@@ -104,24 +73,6 @@ def main():
         print("Config:", config_dict)
 
     configs = Config(config_dict)
-    configs.latent_detach = getattr(configs, "latent_detach", True)
-    configs.latent_adapter = getattr(configs, "latent_adapter", "ln")
-    configs.parallel_mode = getattr(configs, "parallel_mode", "triangular")
-    configs.num_parallel_passes = getattr(configs, "num_parallel_passes", None)
-    configs.ema_decay = getattr(configs, "ema_decay", 0.0)
-    configs.latent_init = getattr(configs, "latent_init", "token")
-    configs.latent_init_std = getattr(configs, "latent_init_std", 0.02)
-    configs.tc_weight = getattr(configs, "tc_weight", 0.05)
-    configs.sd_weight = getattr(configs, "sd_weight", 0.0)
-    configs.tc_distance = getattr(configs, "tc_distance", "mse")
-    configs.tc_norm = getattr(configs, "tc_norm", "rms")
-    configs.parallel_inference = getattr(configs, "parallel_inference", True)
-    configs.use_tail_only_forward = getattr(configs, "use_tail_only_forward", True)
-    configs.use_prefix_kv_cache = getattr(configs, "use_prefix_kv_cache", True)
-    configs.freeze_schedule = _resolve_freeze_schedule(
-        getattr(configs, "freeze_schedule", [6, 0, 0, 0])
-    )
-    configs.grad_clip_norm = getattr(configs, "grad_clip_norm", 0.5)
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -168,6 +119,14 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
+    # --- VC amend ---
+    if getattr(model.config, "eos_token_id", None) is None:
+        model.config.eos_token_id = tokenizer.eos_token_id
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+    print(
+        f"[VC amend] eos={model.config.eos_token_id}, pad={model.config.pad_token_id}"
+    )
     tokenizer.add_tokens("<|start-latent|>")
     tokenizer.add_tokens("<|end-latent|>")
     tokenizer.add_tokens("<|latent|>")
@@ -226,30 +185,15 @@ def main():
         configs.coconut = False
 
     if configs.coconut:
-        model = CoconutParallel(
-            model,
-            latent_id,
-            start_id,
-            end_id,
-            tokenizer.eos_token_id,
-            latent_detach=configs.latent_detach,
-            latent_adapter=configs.latent_adapter,
-            parallel_mode=configs.parallel_mode,
-            num_parallel_passes=configs.num_parallel_passes,
-            ema_decay=configs.ema_decay,
-            latent_init=configs.latent_init,
-            latent_init_std=configs.latent_init_std,
-            tc_weight=configs.tc_weight,
-            sd_weight=configs.sd_weight,
-            tc_distance=configs.tc_distance,
-            tc_norm=configs.tc_norm,
-            use_tail_only_forward=configs.use_tail_only_forward,
-            use_prefix_kv_cache=configs.use_prefix_kv_cache,
-        )
-        model.parallel_inference = configs.parallel_inference
+        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
+
+    # --- VC amend ---
+    wd_decay_params, wd_nodecay_params = _build_wd_param_lists(model)
+    wd_decay_count = sum(p.numel() for p in wd_decay_params)
+    wd_nodecay_count = sum(p.numel() for p in wd_nodecay_params)
 
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
@@ -274,6 +218,7 @@ def main():
             model,
             auto_wrap_policy=llama_auto_wrap_policy,
             device_id=rank,
+            use_orig_params=True,  # --- VC amend ---
         )
 
     del model
@@ -317,15 +262,27 @@ def main():
 
     else:
         optimizer = optim.AdamW(
-            parallel_model.parameters(),
-            lr=configs.lr,
-            weight_decay=configs.weight_decay,
+            [
+                {
+                    "params": wd_decay_params,
+                    "weight_decay": configs.weight_decay,
+                    "lr": configs.lr,
+                },
+                {
+                    "params": wd_nodecay_params,
+                    "weight_decay": 0.0,
+                    "lr": configs.lr,
+                },
+            ],
+            betas=(0.9, 0.95),
+        )
+        print(
+            f"[VC amend] WD groups → decay={wd_decay_count:,} | nodecay={wd_nodecay_count:,}"
         )
 
     best_acc = 0
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
-    current_freeze_stage = None
 
     for epoch in range(configs.resume, configs.num_epochs):
 
@@ -401,24 +358,25 @@ def main():
                 del optimizer
 
                 optimizer = optim.AdamW(
-                    parallel_model.parameters(),
-                    lr=configs.lr,
-                    weight_decay=configs.weight_decay,
+                    [
+                        {
+                            "params": wd_decay_params,
+                            "weight_decay": configs.weight_decay,
+                            "lr": configs.lr,
+                        },
+                        {
+                            "params": wd_nodecay_params,
+                            "weight_decay": 0.0,
+                            "lr": configs.lr,
+                        },
+                    ],
+                    betas=(0.9, 0.95),
+                )
+                print(
+                    f"[VC amend] WD groups → decay={wd_decay_count:,} | nodecay={wd_nodecay_count:,}"
                 )
 
             parallel_model.module.train()
-
-            freeze_stage = min(
-                scheduled_stage, len(configs.freeze_schedule) - 1
-            )
-            if configs.freeze_schedule and freeze_stage != current_freeze_stage:
-                target_blocks = configs.freeze_schedule[freeze_stage]
-                if rank == 0:
-                    print(
-                        f"Applying freeze schedule stage {freeze_stage}: freezing {target_blocks} GPT-2 blocks."
-                    )
-                _apply_gpt2_freeze(parallel_model.module, target_blocks)
-                current_freeze_stage = freeze_stage
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -463,52 +421,21 @@ def main():
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
 
-                latent_stats = getattr(outputs, "stats", None)
-                grad_norm = None
-                if configs.grad_clip_norm and configs.grad_clip_norm > 0:
-                    if isinstance(parallel_model, FSDP):
-                        grad_norm = parallel_model.clip_grad_norm_(
-                            configs.grad_clip_norm
-                        )
-                    else:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            parallel_model.parameters(), configs.grad_clip_norm
-                        )
-
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
+                    torch.nn.utils.clip_grad_norm_(parallel_model.parameters(), max_norm=1.0)  # --- VC amend ---
                     optimizer.step()
                     optimizer.zero_grad()
                     pbar.update(1)
 
                 if wandb_run and rank == 0:
-                    param_sq_norm = 0.0
-                    for param in parallel_model.parameters():
-                        param_sq_norm += (
-                            param.detach().float().norm(p=2).item() ** 2
-                        )
-                    param_norm = math.sqrt(param_sq_norm)
-                    supervised_tokens = int(
-                        batch["labels"].ne(-100).sum().detach().cpu().item()
-                    )
                     log_dict = {
                         "train/epoch": epoch + 1,
                         "train/step": epoch * len(train_dataloader) + step,
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
-                        "train/grad_norm": float(grad_norm)
-                        if grad_norm is not None
-                        else None,
-                        "train/param_norm": param_norm,
-                        "train/supervised_tokens": supervised_tokens,
                     }
-                    if latent_stats:
-                        for key, value in latent_stats.items():
-                            if value is not None:
-                                log_dict[f"train/{key}"] = float(value)
-
-                    log_dict = {k: v for k, v in log_dict.items() if v is not None}
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
@@ -573,6 +500,20 @@ def main():
 
         with torch.no_grad():
             parallel_model.module.eval()
+            gen_kwargs = dict(  # --- VC amend ---
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                synced_gpus=not configs.only_eval,
+            )
+            if rank == 0:  # --- VC amend ---
+                print(
+                    "[VC amend] gen_kwargs → "
+                    + str({k: v for k, v in gen_kwargs.items() if k != "synced_gpus"})
+                )
             for idx, batch in enumerate(valid_gen_dataloader):
                 test_idx = batch["idx"][0]
 
@@ -591,31 +532,16 @@ def main():
                 total += 1
 
                 # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
-                if configs.parallel_inference:
-                    outputs = parallel_model.module.generate(
-                        **batch,
-                        max_new_tokens=max_new_tokens,
-                        synced_gpus=not configs.only_eval,
-                        parallel_mode=configs.parallel_mode,
-                        num_parallel_passes=configs.num_parallel_passes,
-                        ema_decay=configs.ema_decay,
-                    )
-                else:
-                    base_kwargs = {
-                        "input_ids": batch["input_ids"],
-                        "attention_mask": batch.get(
-                            "attention_mask",
-                            torch.ones_like(batch["input_ids"], device=batch["input_ids"].device),
-                        ),
-                        "max_new_tokens": max_new_tokens,
-                    }
-                    outputs = parallel_model.module.base_causallm.generate(**base_kwargs)
+                # --- VC amend ---
+                with FSDP.summon_full_params(
+                    parallel_model, writeback=False, recurse=False
+                ):
+                    outputs = parallel_model.module.generate(**batch, **gen_kwargs)
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                answer_output = text_output.split("#")[-1].replace(",", "").strip()
-                cot_output = (
-                    ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
-                )
+                m = re.search(r"####\s*([\-]?\d+(?:\.\d+)?)", text_output)  # --- VC amend ---
+                answer_output = m.group(1).replace(",", "") if m else ""  # --- VC amend ---
+                cot_output = text_output.split("####")[0].split("\n", 1)[-1].strip()  # --- VC amend ---
 
                 if idx < 5 and rank == 0:
                     # print some examples
