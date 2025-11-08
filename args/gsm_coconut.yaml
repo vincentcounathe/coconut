@@ -1,6 +1,6 @@
 # need 4 gpus
 
-project: coconut-ln
+project: coconut
 save_path: /share/sds/vc383/scratch_coconut/gsm-coconut-ln/checkpoints
 name: gsm-coconut-ln
 
@@ -16,7 +16,7 @@ epochs_per_stage: 3
 max_latent_stage: 3
 pad_latent_to_max: True
 
-save_only_improve: False
+save_only_improve: True
 uniform_prob: 0.0
 model_id: openai-community/gpt2
 load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/gsm-cot/checkpoint_6

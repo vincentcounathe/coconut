@@ -156,6 +156,9 @@ def main():
         )
 
     model = AutoModelForCausalLM.from_pretrained(configs.model_id)
+    if getattr(configs, "coconut", False):
+        # Ensure the base model returns past_key_values for Coconut's KV caching.
+        model.config.use_cache = True
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")

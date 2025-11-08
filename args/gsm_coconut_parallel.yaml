@@ -2,7 +2,7 @@
 
 project: coconut-parallel
 save_path: /share/sds/vc383/scratch_coconut/gsm-parallel/checkpoints
-name: gsm-coconut-parallel
+name: gsm-coconut-parallel-full
 
 only_eval: False
 
@@ -18,15 +18,15 @@ max_latent_stage: 3
 pad_latent_to_max: True
 
 # Stabilizers (unchanged)
-latent_detach: True
+latent_detach: False
 latent_adapter: scale
-freeze_schedule: [3, 2, 1, 0]
+freeze_schedule: [0, 0, 0, 0]
 
 # Parallel-specific params
 parallel_mode: full         # {"triangular","full"}
-num_parallel_passes: 3            # K << N to realize speedup
+num_parallel_passes: 4            # K << N to realize speedup
 ema_decay: 0.0                    
-latent_init: gaussian                # {"token","learned_slot","gaussian"}
+latent_init: token                # {"token","learned_slot","gaussian"}
 latent_init_std: 0.02
 
 # Consistency objectives
@@ -38,7 +38,7 @@ tc_norm: rms                      # {"rms","none"}
 parallel_inference: True
 
 # Rest per baseline
-save_only_improve: False
+save_only_improve: True
 uniform_prob: 0.0
 model_id: openai-community/gpt2
 load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/gsm-cot/checkpoint_6
@@ -52,6 +52,6 @@ batch_size_training: 32
 debug: False
 gradient_accumulation_steps: 1
 num_epochs: 25
-lr: !!float "3e-4"
+lr: !!float "2e-4"
 weight_decay: 0.01
-grad_clip_norm: 1
+grad_clip_norm: 2

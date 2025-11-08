@@ -10,7 +10,9 @@ from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
 Outputs = namedtuple(
-    "Outputs", ["loss", "inputs_embeds", "logits", "stats"], defaults=(None,)
+    "Outputs",
+    ["loss", "inputs_embeds", "logits", "stats", "past_key_values"],
+    defaults=(None, None),
 )
 MAX_N_LATENT = 8
 
@@ -284,7 +286,11 @@ class Coconut(nn.Module):
             )
 
         return Outputs(
-            loss=loss, inputs_embeds=inputs_embeds, logits=logits, stats=aggregated_stats
+            loss=loss,
+            inputs_embeds=inputs_embeds,
+            logits=logits,
+            stats=aggregated_stats,
+            past_key_values=outputs.past_key_values,
         )
 
     def train(self):
@@ -308,6 +314,7 @@ class Coconut(nn.Module):
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
 
         tokens = input_ids[0].detach().tolist()
+        device = input_ids.device
 
         labels = input_ids.clone()  # placeholder. not used.
         outputs = self.forward(
@@ -320,26 +327,53 @@ class Coconut(nn.Module):
         )
         inputs_embeds = outputs.inputs_embeds
 
-        # get the first token using the current hidden state
-        next_token = torch.argmax(outputs.logits[0, -1]).item()
-        tokens.append(next_token)
-        new_token_embed = self.embedding(
-            torch.tensor(next_token, device=input_ids.device)
-        ).view(1, 1, -1)
-        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
+        kv_cache = outputs.past_key_values
+        new_inputs_embeds = inputs_embeds
+        attention_mask = torch.ones(
+            (1, new_inputs_embeds.shape[1]), dtype=torch.long, device=device
+        )
 
-        # get other tokens
-        for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
-            self.gen_forward_cnt += 1
-            next_token = torch.argmax(outputs.logits[0, -1]).item()
-            if next_token == self.eos_token_id:
-                break
+        next_token = torch.argmax(outputs.logits[0, -1]).item()
+        generated = 0
+
+        while generated < max_new_tokens and next_token != self.eos_token_id:
             tokens.append(next_token)
-            new_token_embed = self.embedding(
-                torch.tensor(next_token, device=input_ids.device)
-            ).view(1, 1, -1)
+            token_tensor = torch.tensor(
+                [[next_token]], dtype=torch.long, device=device
+            )
+            new_token_embed = self.embedding(token_tensor)
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones((1, 1), dtype=torch.long, device=device),
+                ),
+                dim=1,
+            )
+            generated += 1
+
+            if generated == max_new_tokens:
+                break
+
+            if kv_cache is None:
+                outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
+            else:
+                position_id = torch.tensor(
+                    [[attention_mask.shape[1] - 1]],
+                    dtype=torch.long,
+                    device=device,
+                )
+                outputs = self.base_causallm(
+                    inputs_embeds=new_token_embed,
+                    attention_mask=attention_mask,
+                    position_ids=position_id,
+                    past_key_values=kv_cache,
+                    use_cache=True,
+                )
+
+            self.gen_forward_cnt += 1
+            kv_cache = outputs.past_key_values
+            next_token = torch.argmax(outputs.logits[0, -1]).item()
 
         if synced_gpus:
             # in FSDP, the number of forward pass need to be the same across devices
