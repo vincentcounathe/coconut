@@ -11,6 +11,7 @@ import wandb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -241,17 +242,28 @@ def main():
     )
 
     if configs.bf16:
-        model.to(torch.bfloat16)
+        half_dtype = torch.bfloat16
+    elif configs.f16:
+        half_dtype = torch.float16
+    model = model.to(half_dtype)
 
     # if only eval, use ddp (to avoid bugs in fsdp)
     if configs.only_eval:
         parallel_model = DDP(model, device_ids=[rank])
 
     else:
+        mp = None
+        if configs.mixed_precision:
+            mp = MixedPrecision(
+                param_dtype=half_dtype,
+                reduce_dtype=half_dtype,
+                buffer_dtype=half_dtype,
+            )
         parallel_model = FSDP(
             model,
             auto_wrap_policy=llama_auto_wrap_policy,
             device_id=rank,
+            mixed_precision=mp
         )
 
     del model
