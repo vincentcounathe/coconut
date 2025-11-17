@@ -3,7 +3,7 @@
 
 project: coconut-stabilized
 save_path: /share/sds/vc383/scratch_coconut/gsm-coconut-2/checkpoints
-name: gsm-coconut-stabilized-ln-gate
+name: smol-gsm-coconut-stabilized-ln=1
 
 only_eval: False
 
@@ -17,17 +17,20 @@ epochs_per_stage: 3
 max_latent_stage: 3
 pad_latent_to_max: True
 latent_detach: False
-latent_adapter: ln
+latent_adapter: ln      # none, scale, ln
+log_attention_metrics: True
 freeze_schedule:
   - 0
   - 0
   - 0
   - 0
 
-save_only_improve: False
+save_only_improve: True
 uniform_prob: 0.0
-model_id: openai-community/gpt2
-load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/gsm-cot/checkpoint_6
+# model_id: openai-community/gpt2
+model_id: HuggingFaceTB/SmolLM-135M
+# load_model_path: /share/sds/vc383/scratch_coconut/gsm-cot-fp32/checkpoints/gsm-cot/checkpoint_6
+load_model_path: /share/sds/vc383/scratch_coconut/smol135-gsm-cot/checkpoints/smol135-gsm-cot/checkpoint_4
 seed: 0
 resume: 3
 bf16: False

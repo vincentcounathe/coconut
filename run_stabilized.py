@@ -85,6 +85,71 @@ def _apply_gpt2_freeze(module, freeze_blocks):
             param.requires_grad = False
 
 
+def _compute_grad_diagnostics(parallel_model, latent_token_id):
+    """
+    Compute gradient diagnostics prior to clipping.
+    """
+    try:
+        device = next(parallel_model.parameters()).device
+    except StopIteration:
+        return {}
+
+    grad_sq = torch.zeros(1, device=device, dtype=torch.float32)
+    param_sq = 0.0
+    for param in parallel_model.parameters():
+        if param.grad is not None:
+            grad_sq += param.grad.detach().float().pow(2).sum()
+        param_sq += param.detach().float().norm(p=2).item() ** 2
+
+    if dist.is_initialized():
+        dist.all_reduce(grad_sq, op=dist.ReduceOp.SUM)
+
+    global_grad_norm = math.sqrt(max(grad_sq.item(), 0.0))
+    param_norm = math.sqrt(param_sq) if param_sq > 0 else 0.0
+    grad_over_param = (
+        global_grad_norm / param_norm if param_norm > 0 else None
+    )
+
+    grad_norm_embed = None
+    grad_norm_latent_rows = None
+    grad_norm_adapter = None
+
+    module = parallel_model.module
+    base_model = module.base_causallm if hasattr(module, "base_causallm") else module
+    embedding_layer = None
+    if hasattr(base_model, "get_input_embeddings"):
+        embedding_layer = base_model.get_input_embeddings()
+    elif hasattr(base_model, "transformer") and hasattr(base_model.transformer, "wte"):
+        embedding_layer = base_model.transformer.wte
+
+    if embedding_layer is not None and embedding_layer.weight.grad is not None:
+        embed_grad = embedding_layer.weight.grad.detach().float()
+        grad_norm_embed = float(embed_grad.norm(p=2).item())
+        if (
+            latent_token_id is not None
+            and 0 <= latent_token_id < embed_grad.shape[0]
+        ):
+            latent_grad = embed_grad[latent_token_id]
+            grad_norm_latent_rows = float(latent_grad.norm(p=2).item())
+
+    adapter = getattr(module, "latent_adapter", None)
+    if adapter is not None:
+        adapter_sq = 0.0
+        for param in adapter.parameters():
+            if param.grad is None:
+                continue
+            adapter_sq += param.grad.detach().float().pow(2).sum().item()
+        if adapter_sq > 0:
+            grad_norm_adapter = math.sqrt(adapter_sq)
+
+    return {
+        "grad_norm_embed": grad_norm_embed,
+        "grad_norm_latent_embed_rows": grad_norm_latent_rows,
+        "grad_norm_adapter": grad_norm_adapter,
+        "grad_over_param": grad_over_param,
+    }
+
+
 def main():
 
     parser = argparse.ArgumentParser(description="coconut")
@@ -109,9 +174,12 @@ def main():
     configs.latent_detach = getattr(configs, "latent_detach", True)
     configs.latent_adapter = getattr(configs, "latent_adapter", "ln")
     configs.freeze_schedule = _resolve_freeze_schedule(
-        getattr(configs, "freeze_schedule", [6, 0, 0, 0])
+        getattr(configs, "freeze_schedule", [0, 0, 0, 0])
     )
     configs.grad_clip_norm = getattr(configs, "grad_clip_norm", 0.5)
+    configs.log_attention_metrics = getattr(
+        configs, "log_attention_metrics", False
+    )
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -155,11 +223,15 @@ def main():
             f"Loading from {configs.load_model_path} and skip the first {configs.resume} epochs"
         )
 
-    model = AutoModelForCausalLM.from_pretrained(configs.model_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        configs.model_id, trust_remote_code=True
+    )
     if getattr(configs, "coconut", False):
         # Ensure the base model returns past_key_values for Coconut's KV caching.
         model.config.use_cache = True
-    tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        configs.model_id, trust_remote_code=True
+    )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")
     tokenizer.add_tokens("<|end-latent|>")
@@ -227,6 +299,7 @@ def main():
             tokenizer.eos_token_id,
             latent_detach=configs.latent_detach,
             latent_adapter=configs.latent_adapter,
+            log_attention_metrics=configs.log_attention_metrics,
         )
 
     if configs.load_model_path != "None" and not loaded:
@@ -307,6 +380,7 @@ def main():
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
     current_freeze_stage = None
+    current_frozen_blocks = []
 
     for epoch in range(configs.resume, configs.num_epochs):
 
@@ -385,12 +459,14 @@ def main():
                     parallel_model.parameters(),
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
-                )
+            )
 
             parallel_model.module.train()
 
-            freeze_stage = min(
-                scheduled_stage, len(configs.freeze_schedule) - 1
+            freeze_stage = (
+                min(scheduled_stage, len(configs.freeze_schedule) - 1)
+                if configs.freeze_schedule
+                else None
             )
             if configs.freeze_schedule and freeze_stage != current_freeze_stage:
                 target_blocks = configs.freeze_schedule[freeze_stage]
@@ -400,6 +476,11 @@ def main():
                     )
                 _apply_gpt2_freeze(parallel_model.module, target_blocks)
                 current_freeze_stage = freeze_stage
+                current_frozen_blocks = (
+                    list(range(target_blocks)) if target_blocks > 0 else []
+                )
+            elif not configs.freeze_schedule:
+                current_frozen_blocks = []
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -445,6 +526,7 @@ def main():
                 loss.backward()
 
                 latent_stats = getattr(outputs, "stats", None)
+                grad_diag = _compute_grad_diagnostics(parallel_model, latent_id)
                 grad_norm = None
                 if configs.grad_clip_norm and configs.grad_clip_norm > 0:
                     if isinstance(parallel_model, FSDP):
@@ -483,11 +565,21 @@ def main():
                         else None,
                         "train/param_norm": param_norm,
                         "train/supervised_tokens": supervised_tokens,
+                        "train/scheduled_stage": scheduled_stage,
+                        "train/freeze_stage": freeze_stage,
+                        "train/target_blocks": (
+                            "[" + ",".join(map(str, current_frozen_blocks)) + "]"
+                            if current_frozen_blocks
+                            else "[]"
+                        ),
                     }
                     if latent_stats:
                         for key, value in latent_stats.items():
                             if value is not None:
                                 log_dict[f"train/{key}"] = float(value)
+                    for key, value in grad_diag.items():
+                        if value is not None:
+                            log_dict[f"train/{key}"] = float(value)
 
                     log_dict = {k: v for k, v in log_dict.items() if v is not None}
                     wandb_run.log(log_dict)
